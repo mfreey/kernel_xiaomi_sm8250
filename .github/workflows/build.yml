@@ -55,26 +55,31 @@ jobs:
           # 追加设备碎片并重新解析依赖
           if [ -f "arch/arm64/configs/vendor/${DEVICE_FRAG}" ]; then
             cat "arch/arm64/configs/vendor/${DEVICE_FRAG}" >> out/.config
+            # 修复：BOARD_MUNCH 等符号在 Kconfig.platforms 中包在 if BOARD_XIAOMI 条件块内，
+            # 碎片未开父开关会被 olddefconfig 静默丢弃，这里补上父开关
+            echo "CONFIG_BOARD_XIAOMI=y" >> out/.config
             make O=out ARCH=arm64 olddefconfig
           else
             echo "!! Fragment not found: arch/arm64/configs/vendor/${DEVICE_FRAG}"
             exit 1
           fi
-          # LTO 模式调整
+          # LTO 模式调整（none/thin 才需要改，full 保持 stock 默认）
           if [ "${LTO}" = "none" ]; then
-            ./scripts/config --file out/.config -d LTO_CLANG_FULL -d LTO_CLANG_THIN -d LTO -d THINLTO
+            ./scripts/config --file out/.config -d LTO_CLANG_FULL -d LTO_CLANG_THIN -d LTO -d THINLTO -e LTO_NONE
             make O=out ARCH=arm64 olddefconfig
           elif [ "${LTO}" = "thin" ]; then
-            ./scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO -e LTO_CLANG_THIN -e THINLTO
+            ./scripts/config --file out/.config -d LTO_CLANG_FULL -d LTO_NONE -e LTO -e LTO_CLANG_THIN -e THINLTO
             make O=out ARCH=arm64 olddefconfig
           fi
-          # 验证关键配置全部生效
+          # 硬校验关键配置全部生效（CHARGER_LN8000_MUNCH 是死配置，不验；由 BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH 实际门控 67W 驱动）
           echo "=== Munch key configs ==="
-          grep -E "CONFIG_(BOARD_MUNCH|QPNP_SMB5_MUNCH|CHARGER_LN8000_MUNCH|FUEL_GAUGE_BQ27Z561_MUNCH|BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH|THERMAL_DIMMING|WIFI_THREE_ANTENNA|USB_PD_POLICY_MUNCH)" out/.config
-          if ! grep -q "CONFIG_BOARD_MUNCH=y" out/.config; then
-            echo "!! CONFIG_BOARD_MUNCH not set, aborting"
-            exit 1
-          fi
+          grep -E "CONFIG_(BOARD_MUNCH|QPNP_SMB5_MUNCH|FUEL_GAUGE_BQ27Z561_MUNCH|BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH|THERMAL_DIMMING|WIFI_THREE_ANTENNA|USB_PD_POLICY_MUNCH|BOARD_XIAOMI)" out/.config
+          for SYM in BOARD_XIAOMI BOARD_MUNCH QPNP_SMB5_MUNCH FUEL_GAUGE_BQ27Z561_MUNCH BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH THERMAL_DIMMING WIFI_THREE_ANTENNA USB_PD_POLICY_MUNCH; do
+            if ! grep -q "CONFIG_${SYM}=y" out/.config; then
+              echo "!! CONFIG_${SYM} not set, aborting"
+              exit 1
+            fi
+          done
 
       - name: Build kernel
         run: |
