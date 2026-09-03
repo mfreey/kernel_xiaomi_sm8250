@@ -32,14 +32,28 @@ jobs:
 
       - name: Download ZyCromerZ Clang toolchain
         run: |
-          mkdir -p $HOME/clang
+          rm -rf /tmp/clang-extract $HOME/clang
           TC_VER="16.0.6-20260807"
           TC_URL="https://github.com/ZyCromerZ/Clang/releases/download/${TC_VER}-release/Clang-${TC_VER}.tar.gz"
           echo "Downloading $TC_URL ..."
           wget -q "$TC_URL" -O /tmp/clang.tar.gz
-          tar xf /tmp/clang.tar.gz -C $HOME/clang --strip-components=1
+          mkdir -p /tmp/clang-extract
+          tar xf /tmp/clang.tar.gz -C /tmp/clang-extract
           rm -f /tmp/clang.tar.gz
+          # 不假设 tarball 布局，直接定位 bin/clang 的真实位置
+          CLANG_BIN=$(find /tmp/clang-extract -type f -name clang -path "*bin/*" | head -1)
+          if [ -z "$CLANG_BIN" ]; then
+            echo "!! clang binary not found in tarball, top-level layout:"
+            find /tmp/clang-extract -maxdepth 3 | head -30
+            exit 1
+          fi
+          TC_ROOT=$(dirname "$(dirname "$CLANG_BIN")")
+          echo "Toolchain root: $TC_ROOT"
+          mkdir -p $HOME/clang
+          mv "$TC_ROOT"/* $HOME/clang/
+          rm -rf /tmp/clang-extract
           $HOME/clang/bin/clang --version | head -2
+          ls -la $HOME/clang/bin/ld.lld $HOME/clang/bin/llvm-ar
 
       - name: Set up environment
         run: |
@@ -85,6 +99,12 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE
           export PATH=$HOME/clang/bin:$PATH
+          # 前置自检：工具链不完整立即失败，避免 syncconfig 死循环空跑
+          for TOOL in clang clang++ ld.lld llvm-ar llvm-nm llvm-strip llvm-objcopy llvm-objdump llvm-readelf; do
+            command -v "$TOOL" >/dev/null 2>&1 || { echo "!! required tool not in PATH: $TOOL"; exit 1; }
+          done
+          clang --version | head -1
+          ld.lld --version | head -1
           make O=out ARCH=arm64 \
             CC=clang \
             CROSS_COMPILE=aarch64-linux-gnu- \
