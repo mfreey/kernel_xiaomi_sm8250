@@ -30,10 +30,15 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq cpio dwarves libncurses-dev zstd bc bison flex libelf-dev openssl libssl-dev lz4 perl zip unzip curl wget git
 
-      - name: Download Neutron Clang toolchain
+      - name: Download ZyCromerZ Clang toolchain
         run: |
           mkdir -p $HOME/clang
-          wget -qO- https://gitlab.com/RandomShark/Neutron-Clang/-/archive/master/Neutron-Clang-master.tar.gz | tar xz -C $HOME/clang --strip-components=1
+          TC_VER="16.0.6-20260807"
+          TC_URL="https://github.com/ZyCromerZ/Clang/releases/download/${TC_VER}-release/Clang-${TC_VER}.tar.gz"
+          echo "Downloading $TC_URL ..."
+          wget -q "$TC_URL" -O /tmp/clang.tar.gz
+          tar xf /tmp/clang.tar.gz -C $HOME/clang --strip-components=1
+          rm -f /tmp/clang.tar.gz
           $HOME/clang/bin/clang --version | head -2
 
       - name: Set up environment
@@ -74,6 +79,7 @@ jobs:
       - name: Build kernel
         run: |
           cd $GITHUB_WORKSPACE
+          export PATH=$HOME/clang/bin:$PATH
           make O=out ARCH=arm64 \
             CC=clang \
             LD=ld.lld \
@@ -85,9 +91,9 @@ jobs:
             OBJSIZE=llvm-size \
             READELF=llvm-readelf \
             HOSTCC=clang \
+            HOSTCXX=clang++ \
             HOSTAR=llvm-ar \
             HOSTLD=ld.lld \
-            PATH=$HOME/clang/bin:$PATH \
             -j$(nproc)
           ls -la out/arch/arm64/boot/
 
