@@ -1,0 +1,121 @@
+name: Build munch Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig_name:
+        description: 'Defconfig base name'
+        required: false
+        default: 'kona_defconfig'
+      device_frag:
+        description: 'Device config fragment'
+        required: false
+        default: 'xiaomi/munch.config'
+      lto:
+        description: 'LTO mode (full | thin | none)'
+        required: false
+        default: 'full'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cpio dwarves libncurses-dev zstd bc bison flex libelf-dev openssl libssl-dev lz4 perl zip unzip curl wget git
+
+      - name: Download Neutron Clang toolchain
+        run: |
+          mkdir -p $HOME/clang
+          wget -qO- https://gitlab.com/RandomShark/Neutron-Clang/-/archive/master/Neutron-Clang-master.tar.gz | tar xz -C $HOME/clang --strip-components=1
+          $HOME/clang/bin/clang --version | head -2
+
+      - name: Set up environment
+        run: |
+          echo "DEFCONFIG=${{ github.event.inputs.defconfig_name || 'kona_defconfig' }}" >> $GITHUB_ENV
+          echo "DEVICE_FRAG=${{ github.event.inputs.device_frag || 'xiaomi/munch.config' }}" >> $GITHUB_ENV
+          echo "LTO=${{ github.event.inputs.lto || 'full' }}" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_TIMESTAMP=Thu Jan 1 00:00:00 UTC 1970" >> $GITHUB_ENV
+
+      - name: Generate defconfig
+        run: |
+          # 生成基础 defconfig
+          make O=out ARCH=arm64 ${DEFCONFIG}
+          # 追加设备碎片并重新解析依赖
+          if [ -f "arch/arm64/configs/vendor/${DEVICE_FRAG}" ]; then
+            cat "arch/arm64/configs/vendor/${DEVICE_FRAG}" >> out/.config
+            make O=out ARCH=arm64 olddefconfig
+          else
+            echo "!! Fragment not found: arch/arm64/configs/vendor/${DEVICE_FRAG}"
+            exit 1
+          fi
+          # LTO 模式调整
+          if [ "${LTO}" = "none" ]; then
+            ./scripts/config --file out/.config -d LTO_CLANG_FULL -d LTO_CLANG_THIN -d LTO -d THINLTO
+            make O=out ARCH=arm64 olddefconfig
+          elif [ "${LTO}" = "thin" ]; then
+            ./scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO -e LTO_CLANG_THIN -e THINLTO
+            make O=out ARCH=arm64 olddefconfig
+          fi
+          # 验证关键配置全部生效
+          echo "=== Munch key configs ==="
+          grep -E "CONFIG_(BOARD_MUNCH|QPNP_SMB5_MUNCH|CHARGER_LN8000_MUNCH|FUEL_GAUGE_BQ27Z561_MUNCH|BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH|THERMAL_DIMMING|WIFI_THREE_ANTENNA|USB_PD_POLICY_MUNCH)" out/.config
+          if ! grep -q "CONFIG_BOARD_MUNCH=y" out/.config; then
+            echo "!! CONFIG_BOARD_MUNCH not set, aborting"
+            exit 1
+          fi
+
+      - name: Build kernel
+        run: |
+          cd $GITHUB_WORKSPACE
+          make O=out ARCH=arm64 \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            STRIP=llvm-strip \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            OBJSIZE=llvm-size \
+            READELF=llvm-readelf \
+            HOSTCC=clang \
+            HOSTAR=llvm-ar \
+            HOSTLD=ld.lld \
+            PATH=$HOME/clang/bin:$PATH \
+            -j$(nproc)
+          ls -la out/arch/arm64/boot/
+
+      - name: Package AnyKernel3 zip
+        run: |
+          AK3=$GITHUB_WORKSPACE/AnyKernel3
+          cp out/arch/arm64/boot/Image $AK3/
+          rm -rf $AK3/.git $AK3/.github $AK3/README.md
+          ZIP_NAME="D8G-munch-$(date +%Y%m%d)-${GITHUB_RUN_NUMBER}.zip"
+          cd $AK3
+          zip -r9 "$GITHUB_WORKSPACE/${ZIP_NAME}" . -x ".git*" -x "*.github*"
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          cd $GITHUB_WORKSPACE
+          ls -la *.zip
+          # 显示内核版本信息
+          strings out/arch/arm64/boot/Image | grep -m1 "Linux version" || true
+
+      - name: Upload kernel zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: |
+            *.zip
+
+      - name: Upload build config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: munch-build-config
+          path: out/.config
+          if-no-files-found: ignore
