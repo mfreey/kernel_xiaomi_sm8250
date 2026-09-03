@@ -41,7 +41,8 @@ jobs:
           tar xf /tmp/clang.tar.gz -C /tmp/clang-extract
           rm -f /tmp/clang.tar.gz
           # 不假设 tarball 布局，直接定位 bin/clang 的真实位置
-          CLANG_BIN=$(find /tmp/clang-extract -type f -name clang -path "*bin/*" | head -1)
+          # bin/clang 在 LLVM 发布包中常为符号链接，不能用 -type f 过滤
+          CLANG_BIN=$(find /tmp/clang-extract -name clang -path "*bin/*" | head -1)
           if [ -z "$CLANG_BIN" ]; then
             echo "!! clang binary not found in tarball, top-level layout:"
             find /tmp/clang-extract -maxdepth 3 | head -30
