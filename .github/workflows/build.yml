@@ -86,6 +86,12 @@ jobs:
             ./scripts/config --file out/.config -d LTO_CLANG_FULL -d LTO_NONE -e LTO -e LTO_CLANG_THIN -e THINLTO
             make O=out ARCH=arm64 olddefconfig
           fi
+          # 三个无默认值 int 符号（arch/arm64/Kconfig:898-917）在 olddefconfig 后写出空值，
+          # make 触发 syncconfig 时空值无效 → 交互式 Restart config → CI 无 stdin 死循环（1.3GB 日志刷屏根因）
+          # 官方 munch-stock 同样不设置它们（kernel/cpu.c 全核回退），等价写 0
+          sed -i -E 's/^(CONFIG_(LITTLE|BIG|PRIME)_CPU_MASK)=$/\1=0/' out/.config
+          echo "=== remaining empty-value lines (diagnostic, string empties are legal) ==="
+          grep -n '=$' out/.config || true
           # 硬校验关键配置全部生效（CHARGER_LN8000_MUNCH 是死配置，不验；由 BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH 实际门控 67W 驱动）
           echo "=== Munch key configs ==="
           grep -E "CONFIG_(BOARD_MUNCH|QPNP_SMB5_MUNCH|FUEL_GAUGE_BQ27Z561_MUNCH|BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH|THERMAL_DIMMING|WIFI_THREE_ANTENNA|USB_PD_POLICY_MUNCH|BOARD_XIAOMI)" out/.config
@@ -106,7 +112,8 @@ jobs:
           done
           clang --version | head -1
           ld.lld --version | head -1
-          make O=out ARCH=arm64 \
+          # 超时防御：kconfig 死循环时最多烧 100 分钟，退出码 124 便于诊断
+          timeout 100m make O=out ARCH=arm64 \
             CC=clang \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
