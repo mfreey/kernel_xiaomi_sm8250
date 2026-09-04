@@ -359,6 +359,50 @@ jobs:
           sub(CPUFREQ_TIMES_C, r'\.release(\s*)=', r'.proc_release\1=',
               count=6, tag="cpufreq_times 6x proc_release", done_marker=".proc_release")
 
+          # ============================================================
+          # 补丁 5: drivers/input/touchscreen/nt36xxx —— procfs 接口迁移
+          #   根因: Run#14 实测 nt36xxx.c:625 proc_create 传
+          #   const struct file_operations *（本树 procfs 为 5.6+ 风格，
+          #   要求 const struct proc_ops *）。kona_defconfig 中
+          #   CONFIG_TOUCHSCREEN_NT36XXX=y 为官方 stock 配置，保功能不改 CONFIG，
+          #   按上游 5.6 方式迁移。两文件共 5 个 fops（成员已逐一核对）：
+          #   - nt36xxx.c nvt_flash_fops: .open/.release/.read（无 .owner/.llseek）
+          #   - nt36xxx_ext_proc.c 4 个 fops: .owner/.open/.read/.llseek/.release
+          #   签名兼容：open(int32_t*)/close/read 与 proc_* 原型一致；
+          #   seq_read/seq_lseek/seq_release 正是上游 5.6 迁移的标准写法。
+          #   .owner 是 file_operations 特有成员（proc_ops 无对应），删除之，
+          #   procfs 条目无法被 rmmod 卸载故无需模块引用计数（上游同做法）。
+          # ============================================================
+          NT_C = "drivers/input/touchscreen/nt36xxx/nt36xxx.c"
+          NT_EXT_C = "drivers/input/touchscreen/nt36xxx/nt36xxx_ext_proc.c"
+
+          # nt36xxx.c: 1 个 fops（.open/.release/.read 各 1 处）
+          sub(NT_C, r'static const struct file_operations (nvt_flash_fops) = \{',
+              r'static const struct proc_ops \1 = {',
+              tag="nt36xxx fops decl", done_marker="static const struct proc_ops nvt_flash_fops")
+          sub(NT_C, r'\.open(\s*)=', r'.proc_open\1=',
+              tag="nt36xxx proc_open", done_marker=".proc_open")
+          sub(NT_C, r'\.read(\s*)=', r'.proc_read\1=',
+              tag="nt36xxx proc_read", done_marker=".proc_read")
+          sub(NT_C, r'\.release(\s*)=', r'.proc_release\1=',
+              tag="nt36xxx proc_release", done_marker=".proc_release")
+
+          # nt36xxx_ext_proc.c: 4 个 fops（.ownerx4 删除，其余各 4 处）
+          sub(NT_EXT_C, r'\.owner(\s*)=\s*THIS_MODULE,(\s*\n)', r'\2',
+              count=4, tag="nt36xxx_ext 4x owner removal", done_marker=".proc_open")
+          sub(NT_EXT_C, r'static const struct file_operations (\w+_fops) = \{',
+              lambda m: 'static const struct proc_ops %s = {' % m.group(1),
+              count=4, tag="nt36xxx_ext 4x fops decl",
+              done_marker="static const struct proc_ops")
+          sub(NT_EXT_C, r'\.open(\s*)=', r'.proc_open\1=',
+              count=4, tag="nt36xxx_ext 4x proc_open", done_marker=".proc_open")
+          sub(NT_EXT_C, r'\.read(\s*)=', r'.proc_read\1=',
+              count=4, tag="nt36xxx_ext 4x proc_read", done_marker=".proc_read")
+          sub(NT_EXT_C, r'\.llseek(\s*)=', r'.proc_lseek\1=',
+              count=4, tag="nt36xxx_ext 4x proc_lseek", done_marker=".proc_lseek")
+          sub(NT_EXT_C, r'\.release(\s*)=', r'.proc_release\1=',
+              count=5, tag="nt36xxx_ext 4x proc_release", done_marker=".proc_release")
+
           def assert_no(path, pattern, desc):
               with open(path, 'r', encoding='utf-8') as f:
                   s = f.read()
@@ -374,6 +418,9 @@ jobs:
           assert_no(LSM_C, r'\bDEFINE_XARRAY\b|\bxa_(load|store|erase|err)\s*\(', "xarray API refs")
           assert_no(FAIR_C, r'(?<!rq_)raw_spin_(un)?lock_irqsave\(\s*rq\s*,', "bare raw_spin_*lock_irqsave(rq")
           assert_no(CPUFREQ_TIMES_C, r'struct file_operations', "cpufreq_times fops decl")
+          assert_no(NT_C, r'struct file_operations', "nt36xxx fops decl")
+          assert_no(NT_EXT_C, r'struct file_operations', "nt36xxx_ext fops decl")
+          assert_no(NT_EXT_C, r'\.owner\s*=', "nt36xxx_ext leftover owner")
 
           if FAILED:
               print("\n!! PATCH FAILURE:")
