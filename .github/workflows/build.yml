@@ -110,6 +110,179 @@ jobs:
             fi
           done
 
+      - name: Patch D8G source fixes
+        run: |
+          # Run#9 根因修复：WALT trace 残留 + AppArmor SK_CTX 与 SELinux 内联数组冲突
+          # 补丁脚本经本地预演验证（幂等，重复执行安全）
+          cat > patch_d8g.py <<'PATCH_EOF'
+          #!/usr/bin/env python3
+          import re, sys
+
+          FAILED = []
+
+          def sub(path, pattern, repl, count=1, flags=0, tag="", done_marker=None):
+              with open(path, 'r', encoding='utf-8') as f:
+                  s = f.read()
+              new, n = re.subn(pattern, repl, s, count=count, flags=flags)
+              if n:
+                  with open(path, 'w', encoding='utf-8', newline='') as f:
+                      f.write(new)
+                  print("  patched %s (%d hit): %s" % (path, n, tag or pattern[:50]))
+                  return
+              if done_marker and done_marker in s:
+                  print("  already patched, skip: %s (%s)" % (path, tag))
+                  return
+              FAILED.append("%s: %s" % (path, tag or pattern[:60]))
+
+          TRACE_H = "include/trace/events/sched.h"
+
+          sub(TRACE_H, r'(__entry->demand\s*=\s*)task_load\(p\);', r'\1task_util(p);',
+              tag="enq_deq task_load", done_marker="task_util(p);")
+          sub(TRACE_H, r'(__entry->pred_demand\s*=\s*)task_pl\(p\);', r'\g<1>0;',
+              tag="enq_deq task_pl", done_marker="pred_demand\t= 0;")
+          sub(TRACE_H, r'cfs_rq->avg\.runnable_load_avg', 'cfs_rq->avg.runnable_avg',
+              tag="cfs_rq runnable_load_avg", done_marker="cfs_rq->avg.runnable_avg")
+          sub(TRACE_H, r'se->avg\.runnable_load_avg', 'se->avg.runnable_avg',
+              tag="se runnable_load_avg", done_marker="se->avg.runnable_avg")
+          sub(TRACE_H, r'(__entry->cpu_util\s*=\s*)cpu_util\(cpu\);', r'\1__cpu_util(cpu);',
+              tag="cpu_util", done_marker="__cpu_util(cpu);")
+          sub(TRACE_H, r'(__entry->irqload\s*=\s*)sched_irqload\(cpu\);', r'\g<1>0;',
+              tag="irqload", done_marker="irqload            = 0;")
+          sub(TRACE_H, r'(__entry->reserved\s*=\s*)is_reserved\(cpu\);', r'\g<1>0;',
+              tag="reserved", done_marker="reserved           = 0;")
+          sub(TRACE_H, r'(__entry->high_irq_load\s*=\s*)sched_cpu_high_irqload\(cpu\);', r'\g<1>0;',
+              tag="high_irq_load", done_marker="high_irq_load      = 0;")
+          sub(TRACE_H, r'(__entry->nr_rtg_high_prio_tasks\s*=\s*)walt_nr_rtg_high_prio\(cpu\);', r'\g<1>0;',
+              tag="nr_rtg_high_prio", done_marker="nr_rtg_high_prio_tasks = 0;")
+          sub(TRACE_H, r'(__entry->high_irqload\s*=\s*)sched_cpu_high_irqload\(cpu\);', r'\g<1>0;',
+              tag="core_ctl high_irqload", done_marker="high_irqload = 0;")
+
+          LSM_C = "security/apparmor/lsm.c"
+
+          AA_STORAGE = r'''
+          /* D8G build fix: sk->sk_security is an SELinux-inline array on this tree;
+           * AppArmor must not reuse it. Keep per-socket aa_sk_ctx in a private
+           * xarray keyed by the sock pointer instead.
+           */
+          #include <linux/xarray.h>
+          static DEFINE_XARRAY(aa_sk_ctx_xa);
+
+          static inline struct aa_sk_ctx *aa_sk_ctx_lookup(struct sock *sk)
+          {
+          	return xa_load(&aa_sk_ctx_xa, (unsigned long)sk);
+          }
+
+          static inline int aa_sk_ctx_store(struct sock *sk, struct aa_sk_ctx *ctx, gfp_t gfp)
+          {
+          	return xa_err(xa_store(&aa_sk_ctx_xa, (unsigned long)sk, ctx, gfp));
+          }
+
+          static inline void aa_sk_ctx_erase(struct sock *sk)
+          {
+          	xa_erase(&aa_sk_ctx_xa, (unsigned long)sk);
+          }
+          '''
+
+          with open(LSM_C, 'r', encoding='utf-8') as f:
+              lsm = f.read()
+          if 'aa_sk_ctx_xa' not in lsm:
+              anchor = '#include "include/net.h"'
+              assert anchor in lsm, "net.h include anchor missing"
+              lsm = lsm.replace(anchor, anchor + '\n' + AA_STORAGE, 1)
+              with open(LSM_C, 'w', encoding='utf-8', newline='') as f:
+                  f.write(lsm)
+              print("  injected aa_sk_ctx xarray storage into", LSM_C)
+          else:
+              print("  aa_sk_ctx storage already present, skip inject")
+
+          sub(LSM_C,
+              r'static int apparmor_sk_alloc_security\(struct sock \*sk, int family, gfp_t flags\)\s*\{.*?\n\}',
+              lambda m: (
+                  "static int apparmor_sk_alloc_security(struct sock *sk, int family, gfp_t flags)\n"
+                  "{\n"
+                  "\tstruct aa_sk_ctx *ctx;\n"
+                  "\tint err;\n"
+                  "\n"
+                  "\tctx = kzalloc(sizeof(*ctx), flags);\n"
+                  "\tif (!ctx)\n"
+                  "\t\treturn -ENOMEM;\n"
+                  "\n"
+                  "\terr = aa_sk_ctx_store(sk, ctx, flags);\n"
+                  "\tif (err) {\n"
+                  "\t\tkfree(ctx);\n"
+                  "\t\treturn err;\n"
+                  "\t}\n"
+                  "\n"
+                  "\treturn 0;\n"
+                  "}"),
+              flags=re.S, tag="sk_alloc_security", done_marker="aa_sk_ctx_store(sk, ctx, flags);")
+
+          sub(LSM_C,
+              r'static void apparmor_sk_free_security\(struct sock \*sk\)\s*\{.*?\n\}',
+              lambda m: (
+                  "static void apparmor_sk_free_security(struct sock *sk)\n"
+                  "{\n"
+                  "\tstruct aa_sk_ctx *ctx = aa_sk_ctx_lookup(sk);\n"
+                  "\n"
+                  "\tif (!ctx)\n"
+                  "\t\treturn;\n"
+                  "\taa_sk_ctx_erase(sk);\n"
+                  "\taa_put_label(ctx->label);\n"
+                  "\taa_put_label(ctx->peer);\n"
+                  "\tkfree(ctx);\n"
+                  "}"),
+              flags=re.S, tag="sk_free_security", done_marker="aa_sk_ctx_erase(sk);")
+
+          sub(LSM_C,
+              r'static void apparmor_sk_clone_security\(const struct sock \*sk,\s*\n\s*struct sock \*newsk\)\s*\{.*?\n\}',
+              lambda m: (
+                  "static void apparmor_sk_clone_security(const struct sock *sk,\n"
+                  "\t\t\t\t       struct sock *newsk)\n"
+                  "{\n"
+                  "\tstruct aa_sk_ctx *ctx = aa_sk_ctx_lookup((struct sock *)sk);\n"
+                  "\tstruct aa_sk_ctx *new = aa_sk_ctx_lookup(newsk);\n"
+                  "\n"
+                  "\tif (!ctx || !new)\n"
+                  "\t\treturn;\n"
+                  "\tif (new->label)\n"
+                  "\t\taa_put_label(new->label);\n"
+                  "\tnew->label = aa_get_label(ctx->label);\n"
+                  "\n"
+                  "\tif (new->peer)\n"
+                  "\t\taa_put_label(new->peer);\n"
+                  "\tnew->peer = aa_get_label(ctx->peer);\n"
+                  "}"),
+              flags=re.S, tag="sk_clone_security", done_marker="aa_sk_ctx_lookup(newsk);")
+
+          sub(LSM_C, r'struct aa_sk_ctx \*ctx = SK_CTX\(sock->sk\);',
+              'struct aa_sk_ctx *ctx = aa_sk_ctx_lookup(sock->sk);',
+              tag="post_create read", done_marker="aa_sk_ctx_lookup(sock->sk);")
+          sub(LSM_C, r'struct aa_sk_ctx \*ctx = SK_CTX\(sk\);',
+              'struct aa_sk_ctx *ctx = aa_sk_ctx_lookup(sk);',
+              count=2, tag="sk_peer_label/sock_graft read", done_marker="struct aa_sk_ctx *ctx = aa_sk_ctx_lookup(sk);")
+
+          def assert_no(path, pattern, desc):
+              with open(path, 'r', encoding='utf-8') as f:
+                  s = f.read()
+              if re.search(pattern, s):
+                  FAILED.append("%s: leftover %s" % (path, desc))
+              else:
+                  print("  clean: %s has no %s" % (path, desc))
+
+          assert_no(TRACE_H, r'(?<![a-zA-Z_])(task_load|task_pl|sched_irqload|is_reserved|sched_cpu_high_irqload|walt_nr_rtg_high_prio)\s*\(', "WALT function refs")
+          assert_no(TRACE_H, r'runnable_load_avg', "runnable_load_avg")
+          assert_no(TRACE_H, r'(?<![a-zA-Z_])cpu_util\(cpu\)', "bare cpu_util(cpu)")
+          assert_no(LSM_C, r'\bSK_CTX\s*\(', "SK_CTX macro use")
+
+          if FAILED:
+              print("\n!! PATCH FAILURE:")
+              for f in FAILED:
+                  print("   -", f)
+              sys.exit(1)
+          print("\n== ALL PATCHES APPLIED CLEANLY ==")
+          PATCH_EOF
+          python3 patch_d8g.py
+
       - name: Build kernel
         run: |
           cd $GITHUB_WORKSPACE
