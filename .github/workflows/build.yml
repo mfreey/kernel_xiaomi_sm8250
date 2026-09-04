@@ -587,8 +587,15 @@ jobs:
           #   - L810 ufshcd_cond_add_cmd_trace()（TRACEPOINTS 分支）调用它
           #   munch.config 原厂开启 CONFIG_SCSI_UFSHCD_CMD_LOGGING=y，
           #   CONFIG_TRACEPOINTS 由依赖链实际生效，两处都编译。
-          #   修复: 在 CMD_LOGGING 分支内补回 __ufshcd_cmd_log 完整实现
-          #   （原 QC 代码语义：写环形日志缓冲 + 门铃快照 + trace 上报）。
+          #   修复: 在 CMD_LOGGING 分支内、首个调用者 ufshcd_cmd_log() 之前
+          #   补回 __ufshcd_cmd_log 完整实现（原 QC 代码语义：写环形日志
+          #   缓冲 + 门铃快照 + trace 上报）。
+          #   ⚠ Run#19 教训: 首版注入在 print_cmd_log 之前（L702），
+          #   而调用者 ufshcd_cmd_log() 在 L686 → 定义出现在调用之后且
+          #   无前置原型，clang 报 "static declaration follows non-static
+          #   declaration"。C 必须先定义（或原型）后调用；#else 轻量版
+          #   (L736) 能过是因为其调用点 L810 在定义之后。新锚点改为
+          #   调用者定义行之前。
           #   依据: 环形缓冲结构 ufshcd_cmd_log{entries,pos,seq_num} 与
           #   打印端字段用法（ufshcd_print_cmd_log L702-730）同文件可核；
           #   门铃寄存器读法照抄本树 #else 轻量版（L746）；并发保护照抄
@@ -596,12 +603,13 @@ jobs:
           #   环形缓冲自身无独立锁，此处按打印端场景取快照，用后即还。
           # ============================================================
           UFS_C = "drivers/scsi/ufs/ufshcd.c"
-          UFS_ANCHOR = "static void ufshcd_print_cmd_log(struct ufs_hba *hba)"
+          UFS_ANCHOR = "static void ufshcd_cmd_log(struct ufs_hba *hba, char *str, char *cmd_type,"
+          UFS_DEFINED = "static void __ufshcd_cmd_log(struct ufs_hba *hba, char *str, char *cmd_type,"
 
           with open(UFS_C, 'r', encoding='utf-8') as f:
               ufs_s = f.read()
-          if '__ufshcd_cmd_log(struct ufs_hba *hba, char *str, char *cmd_type,' in ufs_s and ufs_s.index(UFS_ANCHOR) > ufs_s.index('__ufshcd_cmd_log(struct ufs_hba *hba, char *str, char *cmd_type,'):
-              print("  ufshcd __ufshcd_cmd_log already present before print_cmd_log, skip")
+          if UFS_DEFINED in ufs_s and ufs_s.index(UFS_ANCHOR) > ufs_s.index(UFS_DEFINED):
+              print("  ufshcd __ufshcd_cmd_log already present before ufshcd_cmd_log, skip")
           else:
               UFS_FUNC = (
                   "static void __ufshcd_cmd_log(struct ufs_hba *hba, char *str, char *cmd_type,\n"
@@ -665,15 +673,17 @@ jobs:
           assert_no(KSU_C, r'init_kprobe\(SYS_(?:EXECVE|FACCESSAT|NEWFSTATAT)_SYMBOL,\s*(?!sys_)\w+', "ksu bare kprobe handler names")
           assert_no(SMB_C, r'pr_fmt\(fmt\)[^\n]*,\s*__func__', "smb1355 pr_fmt trailing arg")
 
-          # 补丁 9 正向校验: __ufshcd_cmd_log 定义必须同时存在于
+          # 补丁 9/10 正向校验: __ufshcd_cmd_log 定义必须同时存在于
           # CMD_LOGGING 分支（注入的完整版）与 #else 分支（本树原有轻量版），
-          # 新鲜 checkout 下计数恰为注入后的 2。
+          # 且完整版必须位于调用者 ufshcd_cmd_log() 之前（C 先定义后调用，
+          # Run#19 教训）。新鲜 checkout 下计数恰为注入后的 2。
           with open(UFS_C, 'r', encoding='utf-8') as f:
               _ufs_chk = f.read()
-          if _ufs_chk.count('static void __ufshcd_cmd_log') >= 2:
-              print("  clean: %s has __ufshcd_cmd_log in both branches" % UFS_C)
+          if (_ufs_chk.count('static void __ufshcd_cmd_log') >= 2
+                  and _ufs_chk.index(UFS_DEFINED) < _ufs_chk.index(UFS_ANCHOR)):
+              print("  clean: %s has __ufshcd_cmd_log before its caller in both branches" % UFS_C)
           else:
-              FAILED.append("%s: __ufshcd_cmd_log implementation missing" % UFS_C)
+              FAILED.append("%s: __ufshcd_cmd_log missing or after caller" % UFS_C)
 
           if FAILED:
               print("\n!! PATCH FAILURE:")
