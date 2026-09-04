@@ -577,6 +577,71 @@ jobs:
                       f.write(_s2)
                   print("  patched %s (pr_fmt trailing arg removed)" % _path)
 
+          # ============================================================
+          # 补丁 9: drivers/scsi/ufs/ufshcd.c —— 补回 __ufshcd_cmd_log 实现
+          #   根因: Run#18 实测 L689/L810 两处 error: implicit declaration
+          #   of '__ufshcd_cmd_log'。该文件用 #ifdef CONFIG_SCSI_UFSHCD_
+          #   CMD_LOGGING 把命令环形日志缓冲实现放进 if 分支，但 diphons
+          #   合并时把底层 __ufshcd_cmd_log() 丢进了 #else 分支：
+          #   - L689 ufshcd_cmd_log()（CMD_LOGGING 分支内）调用它 → 找不到
+          #   - L810 ufshcd_cond_add_cmd_trace()（TRACEPOINTS 分支）调用它
+          #   munch.config 原厂开启 CONFIG_SCSI_UFSHCD_CMD_LOGGING=y，
+          #   CONFIG_TRACEPOINTS 由依赖链实际生效，两处都编译。
+          #   修复: 在 CMD_LOGGING 分支内补回 __ufshcd_cmd_log 完整实现
+          #   （原 QC 代码语义：写环形日志缓冲 + 门铃快照 + trace 上报）。
+          #   依据: 环形缓冲结构 ufshcd_cmd_log{entries,pos,seq_num} 与
+          #   打印端字段用法（ufshcd_print_cmd_log L702-730）同文件可核；
+          #   门铃寄存器读法照抄本树 #else 轻量版（L746）；并发保护照抄
+          #   本树 host_lock 惯例 ufs_spin_lock_irqsave（oops 豁免语义）；
+          #   环形缓冲自身无独立锁，此处按打印端场景取快照，用后即还。
+          # ============================================================
+          UFS_C = "drivers/scsi/ufs/ufshcd.c"
+          UFS_ANCHOR = "static void ufshcd_print_cmd_log(struct ufs_hba *hba)"
+
+          with open(UFS_C, 'r', encoding='utf-8') as f:
+              ufs_s = f.read()
+          if '__ufshcd_cmd_log(struct ufs_hba *hba, char *str, char *cmd_type,' in ufs_s and ufs_s.index(UFS_ANCHOR) > ufs_s.index('__ufshcd_cmd_log(struct ufs_hba *hba, char *str, char *cmd_type,'):
+              print("  ufshcd __ufshcd_cmd_log already present before print_cmd_log, skip")
+          else:
+              UFS_FUNC = (
+                  "static void __ufshcd_cmd_log(struct ufs_hba *hba, char *str, char *cmd_type,\n"
+                  "\t\t\t     unsigned int tag, u8 cmd_id, u8 idn, u8 lun,\n"
+                  "\t\t\t     sector_t lba, int transfer_len)\n"
+                  "{\n"
+                  "\tunsigned long flags;\n"
+                  "\tstruct ufshcd_cmd_log_entry *entry;\n"
+                  "\n"
+                  "\tif (!hba->cmd_log.entries)\n"
+                  "\t\treturn;\n"
+                  "\n"
+                  "\t/* snapshot the doorbell under the host lock (same reg read\n"
+                  "\t * as the #else light-weight variant below) */\n"
+                  "\tufs_spin_lock_irqsave(hba->host->host_lock, flags);\n"
+                  "\tentry = &hba->cmd_log.entries[hba->cmd_log.pos];\n"
+                  "\tentry->str = str;\n"
+                  "\tentry->cmd_type = cmd_type;\n"
+                  "\tentry->lun = lun;\n"
+                  "\tentry->cmd_id = cmd_id;\n"
+                  "\tentry->transfer_len = transfer_len;\n"
+                  "\tentry->idn = idn;\n"
+                  "\tentry->doorbell = ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL);\n"
+                  "\tentry->outstanding_reqs = (u32) hba->outstanding_reqs;\n"
+                  "\tentry->tag = tag;\n"
+                  "\tentry->tstamp = ktime_get();\n"
+                  "\tentry->seq_num = hba->cmd_log.seq_num++;\n"
+                  "\thba->cmd_log.pos = (hba->cmd_log.pos + 1) % UFSHCD_MAX_CMD_LOGGING;\n"
+                  "\tufs_spin_unlock_irqrestore(hba->host->host_lock, flags);\n"
+                  "\n"
+                  "\tufshcd_add_command_trace(hba, entry);\n"
+                  "}\n"
+                  "\n"
+              )
+              idx = ufs_s.index(UFS_ANCHOR)
+              ufs_s = ufs_s[:idx] + UFS_FUNC + ufs_s[idx:]
+              with open(UFS_C, 'w', encoding='utf-8', newline='') as f:
+                  f.write(ufs_s)
+              print("  injected __ufshcd_cmd_log into", UFS_C)
+
           def assert_no(path, pattern, desc):
               with open(path, 'r', encoding='utf-8') as f:
                   s = f.read()
@@ -599,6 +664,16 @@ jobs:
           assert_no(NT_MP_C, r'\.owner\s*=', "nt36xxx_mp leftover owner")
           assert_no(KSU_C, r'init_kprobe\(SYS_(?:EXECVE|FACCESSAT|NEWFSTATAT)_SYMBOL,\s*(?!sys_)\w+', "ksu bare kprobe handler names")
           assert_no(SMB_C, r'pr_fmt\(fmt\)[^\n]*,\s*__func__', "smb1355 pr_fmt trailing arg")
+
+          # 补丁 9 正向校验: __ufshcd_cmd_log 定义必须同时存在于
+          # CMD_LOGGING 分支（注入的完整版）与 #else 分支（本树原有轻量版），
+          # 新鲜 checkout 下计数恰为注入后的 2。
+          with open(UFS_C, 'r', encoding='utf-8') as f:
+              _ufs_chk = f.read()
+          if _ufs_chk.count('static void __ufshcd_cmd_log') >= 2:
+              print("  clean: %s has __ufshcd_cmd_log in both branches" % UFS_C)
+          else:
+              FAILED.append("%s: __ufshcd_cmd_log implementation missing" % UFS_C)
 
           if FAILED:
               print("\n!! PATCH FAILURE:")
