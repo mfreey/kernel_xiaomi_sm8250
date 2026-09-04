@@ -671,6 +671,124 @@ jobs:
               'static DEFINE_PER_CPU(struct timerqueue_head, timer_head) = {\n\t.rb_root = RB_ROOT_CACHED,\n};',
               tag="event_timer timerqueue init", done_marker=".rb_root = RB_ROOT_CACHED,")
 
+          # ============================================================
+          # 补丁 12: drivers/soc/qcom/mem-offline.c —— QC memory-hotplug
+          #   私有 mm 接口缺失的五项修复（Run#21 实测）
+          #   CONFIG_QCOM_MEM_OFFLINE=y 为 munch 原厂 DDR 省电特性，保功能修复。
+          #   依据链: 本树 mm/{memory_hotplug,vmscan,page_alloc}.c 全查无
+          #   split_map_pages/release_freepages（QC 树该两函数在 mm/ 侧被
+          #   diphons 合并丢失）；官方 munch-s-oss 旧版 mem-offline.c 无此
+          #   调用属不同代际；split_map_pages 的 4.19 完整实现就在本树
+          #   mm/compaction.c L69（static，需本地自备拷贝）；post_alloc_hook
+          #   在本树 page_alloc.c L2074 为 non-static inline，链接可见，
+          #   加 extern 原型即可调用。
+          #   五项修复:
+          #   (1) L178 rodata_full 未声明 —— 本树 arm64 mmu.c 无该变量
+          #       （5.4+ 特性），改走 else 分支 create_pgtable_mapping，
+          #       与官方 munch 4.19 旧版 mem-offline 行为一致。
+          #   (2) L496 split_map_pages 隐式声明 —— 注入移植实现。
+          #   (3) L595 atomic64_read(&zone->managed_pages) —— 本树
+          #       mmzone.h L470 managed_pages 为 unsigned long（QC 树改过
+          #       atomic64_t），去掉包装直接读。
+          #   (4) L658 release_freepages 隐式声明 —— 注入实现（遍历
+          #       freelist 逐页 __free_page 归还 buddy，gfp.h L591 宏可用）。
+          #   (5) L863 max_pfn 未声明 —— 本树 bootmem.h L24 有声明，补
+          #       include。
+          #   注入位置: struct movable_zone_fill_control 定义之后（L102），
+          #   在 isolate_free_page（首个使用 reset_page_order 的函数）之前
+          #   满足 C 先定义后调用；split_map_pages 的 extern 原型在文件顶
+          #   部无需（同文件 static 定义即原型）。
+          # ============================================================
+          MEMOFF_C = "drivers/soc/qcom/mem-offline.c"
+
+          # (1) rodata_full -> 恒 false，走 create_pgtable_mapping
+          sub(MEMOFF_C, r'if \(rodata_full\)', 'if (0) /* rodata_full: absent on this 4.19 tree, use block mapping */',
+              tag="mem-offline rodata_full", done_marker="/* rodata_full: absent on this 4.19 tree")
+
+          # (3) managed_pages 去 atomic64 包装
+          sub(MEMOFF_C, r'fc->limit = atomic64_read\(&zone->managed_pages\);',
+              'fc->limit = zone->managed_pages;',
+              tag="mem-offline managed_pages", done_marker="fc->limit = zone->managed_pages;")
+
+          # (5) max_pfn: 补 include（bootmem.h 声明 extern unsigned long max_pfn）
+          #     注意: 不能用 sub() —— 替换后 pattern（rpm-smd.h 行）仍在文本中，
+          #     二跑会再插一次（幂等破坏）。改用 marker 先行检查的插入式写法。
+          with open(MEMOFF_C, 'r', encoding='utf-8') as f:
+              _mo_inc = f.read()
+          if 'linux/bootmem.h' in _mo_inc:
+              print("  already patched, skip: %s (mem-offline bootmem.h include)" % MEMOFF_C)
+          else:
+              _anchor_inc = '#include <soc/qcom/rpm-smd.h>'
+              assert _anchor_inc in _mo_inc, "mem-offline include anchor missing"
+              _mo_inc = _mo_inc.replace(_anchor_inc,
+                  _anchor_inc + '\n#include <linux/bootmem.h> /* max_pfn (D8G fix) */', 1)
+              with open(MEMOFF_C, 'w', encoding='utf-8', newline='') as f:
+                  f.write(_mo_inc)
+              print("  patched %s (1 hit): mem-offline bootmem.h include" % MEMOFF_C)
+
+          # (2)+(4) 注入 split_map_pages / release_freepages 实现
+          MEMOFF_ANCHOR = "static int isolate_free_page(struct page *page, unsigned int order)"
+          MEMOFF_HELPERS = (
+              "/* D8G build fix: QC memory-hotplug private mm helpers were lost in\n"
+              " * the diphons merge (their definitions lived in QC's mm/). Ported:\n"
+              " * - split_map_pages: verbatim from this tree mm/compaction.c\n"
+              " * - release_freepages: frees a freelist back to buddy page-by-page\n"
+              " * post_alloc_hook is a non-static inline in mm/page_alloc.c here;\n"
+              " * declare its prototype locally (it is not in any header).\n"
+              " */\n"
+              "extern void post_alloc_hook(struct page *page, unsigned int order,\n"
+              "\t\t\t   gfp_t gfp_flags);\n"
+              "\n"
+              "static void split_map_pages(struct list_head *list)\n"
+              "{\n"
+              "\tunsigned int i, order, nr_pages;\n"
+              "\tstruct page *page, *next;\n"
+              "\tLIST_HEAD(tmp_list);\n"
+              "\n"
+              "\tlist_for_each_entry_safe(page, next, list, lru) {\n"
+              "\t\tlist_del(&page->lru);\n"
+              "\n"
+              "\t\torder = page_private(page);\n"
+              "\t\tnr_pages = 1 << order;\n"
+              "\n"
+              "\t\tpost_alloc_hook(page, order, __GFP_MOVABLE);\n"
+              "\t\tif (order)\n"
+              "\t\t\tsplit_page(page, order);\n"
+              "\n"
+              "\t\tfor (i = 0; i < nr_pages; i++) {\n"
+              "\t\t\tlist_add(&page->lru, &tmp_list);\n"
+              "\t\t\tpage++;\n"
+              "\t\t}\n"
+              "\t}\n"
+              "\n"
+              "\tlist_splice(&tmp_list, list);\n"
+              "}\n"
+              "\n"
+              "static void release_freepages(struct list_head *freelist)\n"
+              "{\n"
+              "\tstruct page *page, *next;\n"
+              "\n"
+              "\tlist_for_each_entry_safe(page, next, freelist, lru) {\n"
+              "\t\tlist_del(&page->lru);\n"
+              "\t\t__free_page(page);\n"
+              "\t}\n"
+              "}\n"
+              "\n"
+          )
+
+          with open(MEMOFF_C, 'r', encoding='utf-8') as f:
+              memo_s = f.read()
+          if "static void split_map_pages(struct list_head *list)" in memo_s:
+              print("  mem-offline mm helpers already present, skip inject")
+          else:
+              assert MEMOFF_ANCHOR in memo_s, "mem-offline inject anchor missing"
+              idx = memo_s.index(MEMOFF_ANCHOR)
+              memo_s = memo_s[:idx] + MEMOFF_HELPERS + memo_s[idx:]
+              with open(MEMOFF_C, 'w', encoding='utf-8', newline='') as f:
+                  f.write(memo_s)
+              print("  injected split_map_pages/release_freepages into", MEMOFF_C)
+
+
           def assert_no(path, pattern, desc):
               with open(path, 'r', encoding='utf-8') as f:
                   s = f.read()
@@ -709,6 +827,22 @@ jobs:
           # 补丁 11 断言: 旧式 timerqueue 静态初始化必须清除
           assert_no(EVT_C, r'\.head\s*=\s*RB_ROOT', "event_timer old timerqueue init")
           assert_no(EVT_C, r'\.next\s*=\s*NULL', "event_timer old next field init")
+
+          # 补丁 12 断言: mem-offline.c 旧接口残留必须清除 + 新实现到位
+          assert_no(MEMOFF_C, r'if \(rodata_full\)', "mem-offline bare rodata_full")
+          assert_no(MEMOFF_C, r'atomic64_read\(&zone->managed_pages\)', "mem-offline atomic64 on plain ulong")
+          with open(MEMOFF_C, 'r', encoding='utf-8') as f:
+              _mo_chk = f.read()
+          if (_mo_chk.count('static void split_map_pages(struct list_head *list)') == 1
+                  and _mo_chk.count('static void release_freepages(struct list_head *freelist)') == 1
+                  and _mo_chk.index('static void split_map_pages(struct list_head *list)')
+                      < _mo_chk.index('static int isolate_free_page(struct page *page, unsigned int order)')
+                  and 'linux/bootmem.h' in _mo_chk
+                  and 'extern void post_alloc_hook' in _mo_chk):
+              print("  clean: %s has helpers injected before first use + bootmem.h included" % MEMOFF_C)
+          else:
+              FAILED.append("%s: mem-offline helpers missing/misplaced or bootmem.h absent" % MEMOFF_C)
+
 
           if FAILED:
               print("\n!! PATCH FAILURE:")
