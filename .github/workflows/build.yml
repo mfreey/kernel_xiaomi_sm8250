@@ -91,6 +91,15 @@ jobs:
             # SK_CTX 冲突同根同源。Android 实际只用 SELinux，munch 官方 stock 亦无
             # Smack，安全禁用；kconfig 解析后行覆盖前行，连带清掉全部子选项
             echo "# CONFIG_SECURITY_SMACK is not set" >> out/.config
+            # 禁用 msm_11ad（60GHz WiGig，munch 无此硬件）与 wil6210（同为
+            # 60GHz WiGig 设备驱动）。kona_defconfig 里两者均为 =m：
+            # - msm_11ad.c L25 无条件 include <linux/sched/core_ctl.h>，
+            #   而该头文件已被 diphons 删除（core_ctl 调度器整体移除），
+            #   Run#17 实测 fatal error: file not found
+            # - 两者均无 munch 依赖，关掉只砍不存在的硬件支持，不碰 Wi-Fi 主链路
+            #   （主 WLAN 为 qca-wifi-host-cmn/CNSS2，另行启用中）
+            echo "# CONFIG_MSM_11AD is not set" >> out/.config
+            echo "# CONFIG_WIL6210 is not set" >> out/.config
             make O=out ARCH=arm64 olddefconfig
           else
             echo "!! Fragment not found: arch/arm64/configs/vendor/${DEVICE_FRAG}"
@@ -129,6 +138,13 @@ jobs:
             grep -E "SECURITY_SMACK|DEFAULT_SECURITY|^CONFIG_LSM" out/.config || true
             exit 1
           fi
+          # msm_11ad/wil6210 禁用校验（同上：防止依赖链意外重新拉起）
+          if grep -qE "^CONFIG_(MSM_11AD|WIL6210)=" out/.config; then
+            echo "!! CONFIG_MSM_11AD / WIL6210 still enabled, aborting"
+            grep -E "MSM_11AD|WIL6210" out/.config || true
+            exit 1
+          fi
+          grep -E "MSM_11AD|WIL6210" out/.config || echo "(msm_11ad / wil6210 confirmed disabled)"
 
       - name: Patch D8G source fixes
         run: |
@@ -444,6 +460,123 @@ jobs:
               'init_kprobe(SYS_NEWFSTATAT_SYMBOL, sys_newfstatat_handler_pre)',
               tag="ksu newfstatat handler name", done_marker="init_kprobe(SYS_NEWFSTATAT_SYMBOL, sys_newfstatat_handler_pre)")
 
+          # ============================================================
+          # 补丁 8a: include/linux/sched/core_ctl.h —— stub 头文件重建
+          #   根因: diphons 删除了高通 core_ctl 调度器（kernel/sched/ 只剩
+          #   cass.c 无 core_ctl.c），但留下 3 个已启用驱动悬空引用该头文件，
+          #   Run#17 实测 msm_11ad.c:25 fatal error: file not found。
+          #   msm_11ad/wil6210 走 CONFIG 禁用（无硬件），但：
+          #   - msm_performance.c (CONFIG_MSM_PERFORMANCE=y): notifier 读
+          #     core_ctl_notif_data 的 4 个字段 + register/unregister API
+          #   - migt.c (drivers/mihw): 调用 core_ctl_set_boost(true/false)
+          #   两者核心功能不依赖 core_ctl 调度器本体，故重建最小 stub 接口
+          #   保住功能（msm_performance 聚合统计 sysfs + migt boost 通路，
+          #   stub 把 boost 调用变为安全 no-op，返回 0 = "已执行"）。
+          #   字段类型核对：nr_big/coloc_load_pct 标量访问，ta_util_pct/
+          #   cur_cap_pct 按 cluster 下标访问（ msm_performance.c L439-444）
+          # ============================================================
+          import os
+          CC_STUB = "include/linux/sched/core_ctl.h"
+          CC_STUB_BODY = r'''/* SPDX-License-Identifier: GPL-2.0 */
+          /* D8G build fix: minimal stub for the removed QCOM core_ctl scheduler.
+           * diphons dropped kernel/sched/core_ctl.c (and this header) but left
+           * msm_performance / migt / msm_11ad referencing it. msm_11ad &
+           * wil6210 are disabled via config (no WiGig hardware on munch);
+           * msm_performance (notif-only consumer) and migt (set_boost caller)
+           * are kept functional: notifier registration becomes a no-op that
+           * never fires, and boost requests are accepted and ignored.
+           */
+          #ifndef _LINUX_SCHED_CORE_CTL_H
+          #define _LINUX_SCHED_CORE_CTL_H
+
+          #include <linux/notifier.h>
+          #include <linux/types.h>
+
+          #define CORE_CTL_NOTIFY_MAX_CLUSTERS 8
+
+          struct core_ctl_notif_data {
+          	unsigned int nr_big;
+          	unsigned int coloc_load_pct;
+          	unsigned int ta_util_pct[CORE_CTL_NOTIFY_MAX_CLUSTERS];
+          	unsigned int cur_cap_pct[CORE_CTL_NOTIFY_MAX_CLUSTERS];
+          };
+
+          /* Real core_ctl never registers these notifiers when absent, so the
+           * consumers never see a callback; a no-op register returning success
+           * keeps msm_performance's aggregation path dormant but valid.
+           */
+          static inline int core_ctl_notifier_register(struct notifier_block *nb)
+          {
+          	return 0;
+          }
+
+          static inline int core_ctl_notifier_unregister(struct notifier_block *nb)
+          {
+          	return 0;
+          }
+
+          /* migt: accept and ignore boost requests (same semantics as the real
+           * core_ctl returning success with no CPU capacity change).
+           */
+          static inline int core_ctl_set_boost(bool boost)
+          {
+          	return 0;
+          }
+
+          #endif
+          '''
+          if not os.path.exists(CC_STUB):
+              os.makedirs(os.path.dirname(CC_STUB), exist_ok=True)
+              with open(CC_STUB, 'w', encoding='utf-8', newline='\n') as f:
+                  f.write(CC_STUB_BODY)
+              print("  created stub header:", CC_STUB)
+          else:
+              print("  stub header already exists, skip:", CC_STUB)
+
+          # ============================================================
+          # 补丁 8b: drivers/power/supply/qcom/smb1355-charger.c —— pr_fmt 宏修复
+          #   根因: Run#17 实测 L854 pr_debug_ratelimited 4 错误级联。
+          #   L6 "#define pr_fmt(fmt) \"SMB1355: %s: \" fmt, __func__" 的
+          #   尾参逗号在 CONFIG_DYNAMIC_DEBUG=y 下使 pr_fmt(fmt) 展开成
+          #   多参数表达式， DEFINE_DYNAMIC_DEBUG_METADATA 的单参 fmt 槽
+          #   塞不进（"too many arguments provided to function-like macro"）。
+          #   修复: 去掉逗号与 __func__ 时必须同时去掉 %s（否则格式串吃掉
+          #   实参导致打印错乱），前缀信息已有 "SMB1355: " 足够定位。
+          #   同类文件已排查: migt.c pr_fmt 无尾参（安全）; drivers/gpu、
+          #   sound/、techpack/ 均在早前轮次全量编译通过无此模式;
+          #   drivers/power/supply/qcom 同目录已启用文件由下方
+          #   全树扫描兜底（runner 上逐一编译级排查）。
+          # ============================================================
+          SMB_C = "drivers/power/supply/qcom/smb1355-charger.c"
+
+          sub(SMB_C, r'#define pr_fmt\(fmt\) "SMB1355: %s: " fmt, __func__',
+              '#define pr_fmt(fmt) "SMB1355: " fmt',
+              tag="smb1355 pr_fmt trailing arg", done_marker='#define pr_fmt(fmt) "SMB1355: " fmt')
+
+          # 补丁 8c: pr_fmt 尾参模式全树扫描（runner 上自动进行，覆盖本地
+          # 无法穷举的文件）。扫描所有已启用驱动源码中 pr_fmt 定义的
+          # "字符串 fmt, 标识符" 尾参写法——该写法在 DYNAMIC_DEBUG 下
+          # 必炸（smb1355 已证明），统一按 8b 同规则修掉。
+          # 逐文件正则同 8b：引号串直接拼 fmt + ", __func__" 结尾。
+          # migt.c 已人工核对不含此模式，即使命中 done_marker 也会跳过。
+          import glob as _glob
+          for _root in ("drivers", "techpack", "sound", "net", "kernel", "fs"):
+              for _path in _glob.glob(_root + "/**/*.c", recursive=True):
+                  with open(_path, 'r', encoding='utf-8', errors='replace') as _f:
+                      _s = _f.read()
+                  _m = re.search(r'#define pr_fmt\(fmt\)\s+("([^"\\]|\\.)*")\s*fmt\s*,\s*__func__\s*$', _s, re.M)
+                  if not _m:
+                      continue
+                  _q = _m.group(1)
+                  if '%s' in _q:
+                      _new = '#define pr_fmt(fmt) ' + _q.replace('%s', '').replace('  ', ' ') + ' fmt'
+                  else:
+                      _new = '#define pr_fmt(fmt) ' + _q + ' fmt'
+                  _s2 = _s[:_m.start()] + _new + _s[_m.end():]
+                  with open(_path, 'w', encoding='utf-8', newline='') as f:
+                      f.write(_s2)
+                  print("  patched %s (pr_fmt trailing arg removed)" % _path)
+
           def assert_no(path, pattern, desc):
               with open(path, 'r', encoding='utf-8') as f:
                   s = f.read()
@@ -465,6 +598,7 @@ jobs:
           assert_no(NT_MP_C, r'struct file_operations', "nt36xxx_mp fops decl")
           assert_no(NT_MP_C, r'\.owner\s*=', "nt36xxx_mp leftover owner")
           assert_no(KSU_C, r'init_kprobe\(SYS_(?:EXECVE|FACCESSAT|NEWFSTATAT)_SYMBOL,\s*(?!sys_)\w+', "ksu bare kprobe handler names")
+          assert_no(SMB_C, r'pr_fmt\(fmt\)[^\n]*,\s*__func__', "smb1355 pr_fmt trailing arg")
 
           if FAILED:
               print("\n!! PATCH FAILURE:")
