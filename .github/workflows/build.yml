@@ -424,6 +424,26 @@ jobs:
           sub(NT_MP_C, r'\.release(\s*)=', r'.proc_release\1=',
               tag="nt36xxx_mp proc_release", done_marker=".proc_release")
 
+          # ============================================================
+          # 补丁 7: drivers/kernelsu/sucompat.c —— kprobe handler 函数名修复
+          #   根因: Run#16 实测 3 处 error: use of undeclared identifier，
+          #   L292-294 的 init_kprobe 第二参数写成 execve_handler_pre /
+          #   faccessat_handler_pre / newfstatat_handler_pre，而实际定义
+          #   （L199/210/220）均带 sys_ 前缀。编译器建议即目标名。
+          #   pts_unix98_lookup_pre（L245/L295）名称一致无问题。
+          # ============================================================
+          KSU_C = "drivers/kernelsu/sucompat.c"
+
+          sub(KSU_C, r'init_kprobe\(SYS_EXECVE_SYMBOL,\s*execve_handler_pre\)',
+              'init_kprobe(SYS_EXECVE_SYMBOL, sys_execve_handler_pre)',
+              tag="ksu execve handler name", done_marker="init_kprobe(SYS_EXECVE_SYMBOL, sys_execve_handler_pre)")
+          sub(KSU_C, r'init_kprobe\(SYS_FACCESSAT_SYMBOL,\s*faccessat_handler_pre\)',
+              'init_kprobe(SYS_FACCESSAT_SYMBOL, sys_faccessat_handler_pre)',
+              tag="ksu faccessat handler name", done_marker="init_kprobe(SYS_FACCESSAT_SYMBOL, sys_faccessat_handler_pre)")
+          sub(KSU_C, r'init_kprobe\(SYS_NEWFSTATAT_SYMBOL,\s*newfstatat_handler_pre\)',
+              'init_kprobe(SYS_NEWFSTATAT_SYMBOL, sys_newfstatat_handler_pre)',
+              tag="ksu newfstatat handler name", done_marker="init_kprobe(SYS_NEWFSTATAT_SYMBOL, sys_newfstatat_handler_pre)")
+
           def assert_no(path, pattern, desc):
               with open(path, 'r', encoding='utf-8') as f:
                   s = f.read()
@@ -444,6 +464,7 @@ jobs:
           assert_no(NT_EXT_C, r'\.owner\s*=', "nt36xxx_ext leftover owner")
           assert_no(NT_MP_C, r'struct file_operations', "nt36xxx_mp fops decl")
           assert_no(NT_MP_C, r'\.owner\s*=', "nt36xxx_mp leftover owner")
+          assert_no(KSU_C, r'init_kprobe\(SYS_(?:EXECVE|FACCESSAT|NEWFSTATAT)_SYMBOL,\s*(?!sys_)\w+', "ksu bare kprobe handler names")
 
           if FAILED:
               print("\n!! PATCH FAILURE:")
