@@ -73,6 +73,10 @@ jobs:
             # 修复：BOARD_MUNCH 等符号在 Kconfig.platforms 中包在 if BOARD_XIAOMI 条件块内，
             # 碎片未开父开关会被 olddefconfig 静默丢弃，这里补上父开关
             echo "CONFIG_BOARD_XIAOMI=y" >> out/.config
+            # diphons cpuset_assist 补丁：cpuset_write_resmask_assist（cpuset.c:1936）无条件引用
+            # struct cs_target（定义在 #ifdef CONFIG_CPUSET_ASSIST 内），不开该配置即编译失败
+            # （Run#8 实测 cpuset.c:1937 incomplete type）。该特性也是调度优化一部分，显式开启
+            echo "CONFIG_CPUSET_ASSIST=y" >> out/.config
             make O=out ARCH=arm64 olddefconfig
           else
             echo "!! Fragment not found: arch/arm64/configs/vendor/${DEVICE_FRAG}"
@@ -98,8 +102,8 @@ jobs:
           grep -n '=$' out/.config || true
           # 硬校验关键配置全部生效（CHARGER_LN8000_MUNCH 是死配置，不验；由 BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH 实际门控 67W 驱动）
           echo "=== Munch key configs ==="
-          grep -E "CONFIG_(BOARD_MUNCH|QPNP_SMB5_MUNCH|FUEL_GAUGE_BQ27Z561_MUNCH|BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH|THERMAL_DIMMING|WIFI_THREE_ANTENNA|USB_PD_POLICY_MUNCH|BOARD_XIAOMI)" out/.config
-          for SYM in BOARD_XIAOMI BOARD_MUNCH QPNP_SMB5_MUNCH FUEL_GAUGE_BQ27Z561_MUNCH BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH THERMAL_DIMMING WIFI_THREE_ANTENNA USB_PD_POLICY_MUNCH; do
+          grep -E "CONFIG_(BOARD_MUNCH|QPNP_SMB5_MUNCH|FUEL_GAUGE_BQ27Z561_MUNCH|BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH|THERMAL_DIMMING|WIFI_THREE_ANTENNA|USB_PD_POLICY_MUNCH|BOARD_XIAOMI|CPUSET_ASSIST)" out/.config
+          for SYM in BOARD_XIAOMI BOARD_MUNCH QPNP_SMB5_MUNCH FUEL_GAUGE_BQ27Z561_MUNCH BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH THERMAL_DIMMING WIFI_THREE_ANTENNA USB_PD_POLICY_MUNCH CPUSET_ASSIST; do
             if ! grep -q "CONFIG_${SYM}=y" out/.config; then
               echo "!! CONFIG_${SYM} not set, aborting"
               exit 1
