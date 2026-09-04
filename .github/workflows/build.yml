@@ -110,6 +110,24 @@ jobs:
             # 高通 lpm-levels governor（rating=30），开启后 TEO 接管
             # 默认 idle 选核（这是 WFI 防超时特性生效的必然要求）。
             echo "CONFIG_CPU_IDLE_GOV_TEO=y" >> out/.config
+            # 补丁14：禁用 3 个 modpost 失败模块（Run#23 实测 MODPOST 10 modules
+            # 中 3 个找不到 .mod.c：rdbg/mpq-adapter/mpq-dmx-hw-plugin）。
+            # - MSM_RDBG：PC 端硬件调试器连 ADSP/CDSP 固件调试通道（/dev/rdbg_*），
+            #   零售机 DSP 固件无 debug stub，rdbg_open 的
+            #   check_subsystem_debug_enabled() 直接失败，永不激活；
+            #   开发者模式/ADB/ramdump/定位均走独立链路（DIAG_CHAR/
+            #   QCOM_MEMORY_DUMP_V2/QRTR_SMD），零影响
+            # - DVB_MPQ / DVB_MPQ_DEMUX：DVB 电视广播解复用硬件驱动，
+            #   munch 主板无此芯片，纯死代码；子项 DVB_MPQ_SW 随父项
+            #   关闭自动失效
+            # 另：AnyKernel3 包只装 Image 不装 .ko，这 3 个模块本来就
+            # 不会出现在手机上，禁用只影响 CI 构建产物
+            echo "# CONFIG_MSM_RDBG is not set" >> out/.config
+            echo "# CONFIG_DVB_MPQ is not set" >> out/.config
+            echo "# CONFIG_DVB_MPQ_DEMUX is not set" >> out/.config
+            # 内核命名：Aurora（极光）——冷静/流动/省电观感，切合
+            # 官方省电调度+温控定位；显示为 4.19.157-Aurora
+            echo "CONFIG_LOCALVERSION=-Aurora" >> out/.config
             make O=out ARCH=arm64 olddefconfig
           else
             echo "!! Fragment not found: arch/arm64/configs/vendor/${DEVICE_FRAG}"
@@ -160,6 +178,21 @@ jobs:
           else
             echo "!! CONFIG_CPU_IDLE_GOV_TEO not set, aborting"
             grep -E "CPU_IDLE" out/.config || true
+            exit 1
+          fi
+          # 补丁14 校验：3 个模块禁用生效（防止依赖链意外重新拉起）
+          if grep -qE "^CONFIG_(MSM_RDBG|DVB_MPQ|DVB_MPQ_DEMUX)=" out/.config; then
+            echo "!! CONFIG_MSM_RDBG / DVB_MPQ / DVB_MPQ_DEMUX still enabled, aborting"
+            grep -E "MSM_RDBG|DVB_MPQ" out/.config || true
+            exit 1
+          fi
+          grep -E "MSM_RDBG|DVB_MPQ" out/.config || echo "(rdbg / dvb-mpq confirmed disabled)"
+          # 内核名校验：LOCALVERSION 必须是 Aurora
+          if grep -q '^CONFIG_LOCALVERSION="-Aurora"$' out/.config; then
+            echo "(LOCALVERSION confirmed: -Aurora)"
+          else
+            echo "!! CONFIG_LOCALVERSION missing/changed, aborting"
+            grep -E "LOCALVERSION" out/.config || true
             exit 1
           fi
           grep -E "MSM_11AD|WIL6210" out/.config || echo "(msm_11ad / wil6210 confirmed disabled)"
