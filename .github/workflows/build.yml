@@ -650,6 +650,27 @@ jobs:
                   f.write(ufs_s)
               print("  injected __ufshcd_cmd_log into", UFS_C)
 
+          # ============================================================
+          # 补丁 11: drivers/soc/qcom/event_timer.c —— timerqueue 新旧结构适配
+          #   根因: Run#20 实测 L46/L47 field designator 'head'/'next' 不在
+          #   struct timerqueue_head 中。本树 timerqueue.h 已回迁 5.x 的
+          #   rbtree-cached 改造: struct timerqueue_head 只有
+          #   struct rb_root_cached rb_root 一个成员（head 字段改名、
+          #   next 字段删除，缓存到 leftmost）。QC 的 event_timer.c 仍用
+          #   4.19 原始静态初始化 {.head = RB_ROOT, .next = NULL}。
+          #   修复: 改写为本树官方初始化写法 —— timerqueue.h 的
+          #   timerqueue_init_head() 正是 rb_root = RB_ROOT_CACHED，照抄。
+          #   依据: 全树搜 "DEFINE_PER_CPU(struct timerqueue_head" 仅此
+          #   一处；其余用户 (rtc.h, lib/timerqueue.c) 均已适配新结构；
+          #   文件内其余访问全部走 timerqueue_add/del/getnext 封装。
+          # ============================================================
+          EVT_C = "drivers/soc/qcom/event_timer.c"
+
+          sub(EVT_C,
+              r'static DEFINE_PER_CPU\(struct timerqueue_head, timer_head\) = \{\s*\n\s*\.head = RB_ROOT,\s*\n\s*\.next = NULL,\s*\n\s*\};',
+              'static DEFINE_PER_CPU(struct timerqueue_head, timer_head) = {\n\t.rb_root = RB_ROOT_CACHED,\n};',
+              tag="event_timer timerqueue init", done_marker=".rb_root = RB_ROOT_CACHED,")
+
           def assert_no(path, pattern, desc):
               with open(path, 'r', encoding='utf-8') as f:
                   s = f.read()
@@ -684,6 +705,10 @@ jobs:
               print("  clean: %s has __ufshcd_cmd_log before its caller in both branches" % UFS_C)
           else:
               FAILED.append("%s: __ufshcd_cmd_log missing or after caller" % UFS_C)
+
+          # 补丁 11 断言: 旧式 timerqueue 静态初始化必须清除
+          assert_no(EVT_C, r'\.head\s*=\s*RB_ROOT', "event_timer old timerqueue init")
+          assert_no(EVT_C, r'\.next\s*=\s*NULL', "event_timer old next field init")
 
           if FAILED:
               print("\n!! PATCH FAILURE:")
