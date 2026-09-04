@@ -100,6 +100,16 @@ jobs:
             #   （主 WLAN 为 qca-wifi-host-cmn/CNSS2，另行启用中）
             echo "# CONFIG_MSM_11AD is not set" >> out/.config
             echo "# CONFIG_WIL6210 is not set" >> out/.config
+            # 开启 TEO cpuidle governor：Run#22 实测 LTO 链接期
+            # undefined symbol teo_wfi_timeout_ns —— diphons 的 WFI
+            # 防超时特性（arch/arm64/kernel/process.c L81/L85）调用
+            # drivers/cpuidle/governors/teo.c 的实现，但 kona_defconfig
+            # 未开 CONFIG_CPU_IDLE_GOV_TEO，teo.o 根本不编入。
+            # Kconfig 上 TEO 无额外 depends（CPU_IDLE=y 已开），echo 后
+            # olddefconfig 必然保留。注意行为影响：TEO rating=50 高于
+            # 高通 lpm-levels governor（rating=30），开启后 TEO 接管
+            # 默认 idle 选核（这是 WFI 防超时特性生效的必然要求）。
+            echo "CONFIG_CPU_IDLE_GOV_TEO=y" >> out/.config
             make O=out ARCH=arm64 olddefconfig
           else
             echo "!! Fragment not found: arch/arm64/configs/vendor/${DEVICE_FRAG}"
@@ -126,7 +136,7 @@ jobs:
           # 硬校验关键配置全部生效（CHARGER_LN8000_MUNCH 是死配置，不验；由 BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH 实际门控 67W 驱动）
           echo "=== Munch key configs ==="
           grep -E "CONFIG_(BOARD_MUNCH|QPNP_SMB5_MUNCH|FUEL_GAUGE_BQ27Z561_MUNCH|BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH|THERMAL_DIMMING|WIFI_THREE_ANTENNA|USB_PD_POLICY_MUNCH|BOARD_XIAOMI|CPUSET_ASSIST|TOUCHSCREEN_XIAOMI_TOUCHFEATURE|SECURITY_SMACK)" out/.config
-          for SYM in BOARD_XIAOMI BOARD_MUNCH QPNP_SMB5_MUNCH FUEL_GAUGE_BQ27Z561_MUNCH BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH THERMAL_DIMMING WIFI_THREE_ANTENNA USB_PD_POLICY_MUNCH CPUSET_ASSIST TOUCHSCREEN_XIAOMI_TOUCHFEATURE; do
+          for SYM in BOARD_XIAOMI BOARD_MUNCH QPNP_SMB5_MUNCH FUEL_GAUGE_BQ27Z561_MUNCH BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH THERMAL_DIMMING WIFI_THREE_ANTENNA USB_PD_POLICY_MUNCH CPUSET_ASSIST TOUCHSCREEN_XIAOMI_TOUCHFEATURE CPU_IDLE_GOV_TEO; do
             if ! grep -q "CONFIG_${SYM}=y" out/.config; then
               echo "!! CONFIG_${SYM} not set, aborting"
               exit 1
@@ -142,6 +152,14 @@ jobs:
           if grep -qE "^CONFIG_(MSM_11AD|WIL6210)=" out/.config; then
             echo "!! CONFIG_MSM_11AD / WIL6210 still enabled, aborting"
             grep -E "MSM_11AD|WIL6210" out/.config || true
+            exit 1
+          fi
+          # TEO governor 校验：防止依赖链意外丢弃（teo_wfi_timeout_ns 链接依赖）
+          if grep -q "^CONFIG_CPU_IDLE_GOV_TEO=y" out/.config; then
+            echo "(CPU_IDLE_GOV_TEO confirmed enabled)"
+          else
+            echo "!! CONFIG_CPU_IDLE_GOV_TEO not set, aborting"
+            grep -E "CPU_IDLE" out/.config || true
             exit 1
           fi
           grep -E "MSM_11AD|WIL6210" out/.config || echo "(msm_11ad / wil6210 confirmed disabled)"
@@ -843,6 +861,115 @@ jobs:
           else:
               FAILED.append("%s: mem-offline helpers missing/misplaced or bootmem.h absent" % MEMOFF_C)
 
+          # ============================================================
+          # 补丁 13: LTO 链接期 undefined symbol 三项修复（Run#22 实测，
+          #   vmlinux.o MODPOST 后 ld.lld 报 5 个未定义符号，编译阶段全过）
+          # ============================================================
+          # (A) __cpu_overutilized —— kernel/sched/fair.c
+          #   依据链: sched.h L2169 有原型 `bool __cpu_overutilized(int cpu, int delta);`
+          #   （CONFIG_SMP 块内），fair.c L7934 find_energy_efficient_cpu()
+          #   EAS 唤醒路径引用 `__cpu_overutilized(prev_cpu, delta)`，但全树
+          #   无定义体（diphons 部分合并丢失：保留声明+引用，丢了实现）。
+          #   官方 munch-s-oss fair.c L5478 有原始实现，但其依赖的
+          #   sched_capacity_margin_up[] 数组在本树已被 diphons 换成
+          #   util_fits_cpu() 体系（fair.c 仅 6 处 margin 注释，无数组），
+          #   官方式整体移植不可行。改为用本树 cpu_overutilized()
+          #   （fair.c L6355，同样被 sched.h L2170 声明）完全相同的
+          #   util_fits_cpu 语义 + delta 偏移实现，保证口径一致。
+          #   delta 在调用点（L7753 定义恒 0，后续未再赋值）无负值场景，
+          #   cpu_util_cfs(cpu)+delta 类型提升安全。
+          FAIR_C = "kernel/sched/fair.c"
+          CPU_OVERUTIL_DEF = (
+              "/* D8G build fix: __cpu_overutilized() prototype lives in sched.h\n"
+              " * (CONFIG_SMP block) and find_energy_efficient_cpu() references\n"
+              " * it, but the definition was lost in the diphons merge. Rebuild\n"
+              " * it with the exact same util_fits_cpu() semantics as the\n"
+              " * cpu_overutilized() right below, plus the delta headroom.\n"
+              " */\n"
+              "bool __cpu_overutilized(int cpu, int delta)\n"
+              "{\n"
+              "\tunsigned long rq_util_min = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MIN);\n"
+              "\tunsigned long rq_util_max = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MAX);\n"
+              "\n"
+              "\treturn !util_fits_cpu(cpu_util_cfs(cpu) + delta, rq_util_min,\n"
+              "\t\t\t\t rq_util_max, cpu);\n"
+              "}\n"
+              "\n"
+          )
+          with open(FAIR_C, 'r', encoding='utf-8') as f:
+              _fair_s = f.read()
+          if 'bool __cpu_overutilized(int cpu, int delta)' in _fair_s and _fair_s.count('bool __cpu_overutilized') >= 2:
+              print("  already patched, skip: %s (__cpu_overutilized def)" % FAIR_C)
+          elif 'bool __cpu_overutilized(int cpu, int delta)' in _fair_s and 'D8G build fix: __cpu_overutilized' in _fair_s:
+              print("  already patched, skip: %s (__cpu_overutilized def)" % FAIR_C)
+          else:
+              _fair_anchor = 'bool cpu_overutilized(int cpu)\n{'
+              assert _fair_s.count(_fair_anchor) == 1, "fair.c cpu_overutilized anchor missing/duplicated"
+              _fair_s = _fair_s.replace(_fair_anchor, CPU_OVERUTIL_DEF + _fair_anchor, 1)
+              with open(FAIR_C, 'w', encoding='utf-8', newline='') as f:
+                  f.write(_fair_s)
+              print("  patched %s (1 hit): __cpu_overutilized definition" % FAIR_C)
+
+          # (B) ksu_vfs_read_hook / ksu_execveat_hook / ksu_input_hook
+          #   —— drivers/kernelsu/ksud.c
+          #   依据链: 引用侧 fs/read_write.c(vfs_read)、fs/exec.c
+          #   (do_execveat_common)、drivers/input/input.c
+          #   (input_handle_event) 均以 `extern bool ksu_xxx_hook
+          #   __read_mostly;` 声明后引用（仅受 CONFIG_KSU 门控）；而
+          #   ksud.c L50-58 的定义体包在 `#else /* !CONFIG_KPROBES */`
+          #   分支——本树 kona_defconfig CONFIG_KPROBES=y 走 KPROBES 分支
+          #   （只有 work_struct），3 个 hook 变量本体无定义 → 链接失败。
+          #   修复: 把 3 个定义移出条件块（#endif 之后无条件定义）。语义
+          #   不变: KPROBES 模式下变量恒 true，stop 走 kprobe 注销路径
+          #   （schedule_work），不读这些变量；非 KPROBES 模式下行为
+          #   与原版完全一致。
+          KSUD_C = "drivers/kernelsu/ksud.c"
+          _ksud_old = (
+              "#else\n"
+              "bool ksu_vfs_read_hook __read_mostly = true;\n"
+              "bool ksu_execveat_hook __read_mostly = true;\n"
+              "bool ksu_input_hook __read_mostly = true;\n"
+              "#endif\n"
+          )
+          _ksud_new = (
+              "#endif /* CONFIG_KPROBES */\n"
+              "/* D8G build fix: hook flags must exist in BOTH kprobes and\n"
+              " * non-kprobes builds — fs/read_write.c, fs/exec.c and\n"
+              " * drivers/input/input.c reference them under CONFIG_KSU only.\n"
+              " */\n"
+              "bool ksu_vfs_read_hook __read_mostly = true;\n"
+              "bool ksu_execveat_hook __read_mostly = true;\n"
+              "bool ksu_input_hook __read_mostly = true;\n"
+          )
+          with open(KSUD_C, 'r', encoding='utf-8') as f:
+              _ksud_s = f.read()
+          if 'D8G build fix: hook flags must exist' in _ksud_s:
+              print("  already patched, skip: %s (ksu hook flags)" % KSUD_C)
+          else:
+              assert _ksud_s.count(_ksud_old) == 1, "ksud.c kprobes #else block anchor missing/duplicated"
+              _ksud_s = _ksud_s.replace(_ksud_old, _ksud_new, 1)
+              with open(KSUD_C, 'w', encoding='utf-8', newline='') as f:
+                  f.write(_ksud_s)
+              print("  patched %s (1 hit): ksu hook flag definitions unconditional" % KSUD_C)
+
+          # 补丁 13 断言: fair.c 定义就位且在引用点之前；ksud.c 双分支均有定义
+          with open(FAIR_C, 'r', encoding='utf-8') as f:
+              _fair_chk = f.read()
+          if (_fair_chk.count('bool __cpu_overutilized(int cpu, int delta)\n{') == 1
+                  and _fair_chk.index('bool __cpu_overutilized(int cpu, int delta)\n{')
+                      < _fair_chk.index('__cpu_overutilized(prev_cpu, delta)')):
+              print("  clean: %s has __cpu_overutilized defined before EAS reference" % FAIR_C)
+          else:
+              FAILED.append("%s: __cpu_overutilized def missing or after EAS call" % FAIR_C)
+          with open(KSUD_C, 'r', encoding='utf-8') as f:
+              _ksud_chk = f.read()
+          if (_ksud_chk.count('bool ksu_vfs_read_hook __read_mostly = true;') == 1
+                  and _ksud_chk.count('bool ksu_execveat_hook __read_mostly = true;') == 1
+                  and _ksud_chk.count('bool ksu_input_hook __read_mostly = true;') == 1
+                  and _ksud_chk.count('#else\nbool ksu_vfs_read_hook') == 0):
+              print("  clean: %s has exactly one definition of each ksu hook flag" % KSUD_C)
+          else:
+              FAILED.append("%s: ksu hook flag definitions duplicated or missing" % KSUD_C)
 
           if FAILED:
               print("\n!! PATCH FAILURE:")
