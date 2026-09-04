@@ -403,6 +403,27 @@ jobs:
           sub(NT_EXT_C, r'\.release(\s*)=', r'.proc_release\1=',
               count=5, tag="nt36xxx_ext 4x proc_release", done_marker=".proc_release")
 
+          # nt36xxx_mp_ctrlram.c: 1 个 fops（.owner/.open/.read/.llseek/.release 各 1 处）
+          #   Run#15 实测 nt36xxx_mp_ctrlram.c:1448 proc_create 传
+          #   nvt_selftest_fops（file_operations），与 ext_proc 同构，同法迁移。
+          #   教训：此前只取了目录前 4 个文件，漏掉本文件——同类排查必须
+          #   覆盖目标目录全部源文件（API 已确认目录共 5 个 .c + 3 个头文件）。
+          NT_MP_C = "drivers/input/touchscreen/nt36xxx/nt36xxx_mp_ctrlram.c"
+
+          sub(NT_MP_C, r'\.owner(\s*)=\s*THIS_MODULE,(\s*\n)', r'\2',
+              tag="nt36xxx_mp owner removal", done_marker=".proc_open")
+          sub(NT_MP_C, r'static const struct file_operations (nvt_selftest_fops) = \{',
+              r'static const struct proc_ops \1 = {',
+              tag="nt36xxx_mp fops decl", done_marker="static const struct proc_ops nvt_selftest_fops")
+          sub(NT_MP_C, r'\.open(\s*)=', r'.proc_open\1=',
+              tag="nt36xxx_mp proc_open", done_marker=".proc_open")
+          sub(NT_MP_C, r'\.read(\s*)=', r'.proc_read\1=',
+              tag="nt36xxx_mp proc_read", done_marker=".proc_read")
+          sub(NT_MP_C, r'\.llseek(\s*)=', r'.proc_lseek\1=',
+              tag="nt36xxx_mp proc_lseek", done_marker=".proc_lseek")
+          sub(NT_MP_C, r'\.release(\s*)=', r'.proc_release\1=',
+              tag="nt36xxx_mp proc_release", done_marker=".proc_release")
+
           def assert_no(path, pattern, desc):
               with open(path, 'r', encoding='utf-8') as f:
                   s = f.read()
@@ -421,6 +442,8 @@ jobs:
           assert_no(NT_C, r'struct file_operations', "nt36xxx fops decl")
           assert_no(NT_EXT_C, r'struct file_operations', "nt36xxx_ext fops decl")
           assert_no(NT_EXT_C, r'\.owner\s*=', "nt36xxx_ext leftover owner")
+          assert_no(NT_MP_C, r'struct file_operations', "nt36xxx_mp fops decl")
+          assert_no(NT_MP_C, r'\.owner\s*=', "nt36xxx_mp leftover owner")
 
           if FAILED:
               print("\n!! PATCH FAILURE:")
