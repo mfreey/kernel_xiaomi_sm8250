@@ -1034,7 +1034,12 @@ jobs:
           echo "=== after sed: warn-stack-size lines ==="
           grep -n 'warn-stack-size' Makefile || echo '(none)'
           # 超时防御：kconfig 死循环时最多烧 100 分钟，退出码 124 便于诊断
-          timeout 100m make O=out ARCH=arm64 \
+          # 补丁15：构建目标显式指定 Image（非默认 all）——4.19 在 O=out 下
+          # parallel make 的 modpost 存在时序竞态（Run#23/#25 实测：每轮都有
+          # 不同模块的 .mod.c 未生成就触发 CC .mod.o，报 no such file，
+          # 禁掉一批下批又出）；AnyKernel3 只装 Image 不装任何 .ko，
+          # 模块阶段纯凑数，直接跳过；Image 目标已含 vmlinux 依赖链
+          timeout 100m make O=out ARCH=arm64 Image \
             CC=clang \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
