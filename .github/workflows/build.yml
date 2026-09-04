@@ -77,6 +77,15 @@ jobs:
             # struct cs_target（定义在 #ifdef CONFIG_CPUSET_ASSIST 内），不开该配置即编译失败
             # （Run#8 实测 cpuset.c:1937 incomplete type）。该特性也是调度优化一部分，显式开启
             echo "CONFIG_CPUSET_ASSIST=y" >> out/.config
+            # 开启小米触摸特性：Run#13 实测 focaltech_3658u 的 fts_update_gesture_state
+            # (core.c L1933) 与 gesture.c L355/358 裸引用 ts_data->gesture_status，
+            # 而该成员仅存在于 #ifdef CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE
+            # (core.h L239-246)。开启后引用链闭合（xiaomi_touch 驱动完整存在于
+            # touchscreen/xiaomi/，Kconfig 符号有效），且与官方 munch stock 行为
+            # 一致（双击唤醒/游戏模式用户态接口，HyperOS 触控调优依赖）。
+            # 不选给源码加 #ifdef 的方案：会同时砍功能且 gesture.c 的
+            # CONFIG_TOUCHSCREEN_COMMON 调用点也会断链，改动更大风险更高
+            echo "CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE=y" >> out/.config
             # 禁用 Smack：Run#11 实测 smack_lsm.c 20+ 处把 sk->sk_security（本树为
             # SELinux 专用内联数组）当 struct socket_smack * 指针用，与 AppArmor 的
             # SK_CTX 冲突同根同源。Android 实际只用 SELinux，munch 官方 stock 亦无
@@ -107,8 +116,8 @@ jobs:
           grep -n '=$' out/.config || true
           # 硬校验关键配置全部生效（CHARGER_LN8000_MUNCH 是死配置，不验；由 BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH 实际门控 67W 驱动）
           echo "=== Munch key configs ==="
-          grep -E "CONFIG_(BOARD_MUNCH|QPNP_SMB5_MUNCH|FUEL_GAUGE_BQ27Z561_MUNCH|BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH|THERMAL_DIMMING|WIFI_THREE_ANTENNA|USB_PD_POLICY_MUNCH|BOARD_XIAOMI|CPUSET_ASSIST|SECURITY_SMACK)" out/.config
-          for SYM in BOARD_XIAOMI BOARD_MUNCH QPNP_SMB5_MUNCH FUEL_GAUGE_BQ27Z561_MUNCH BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH THERMAL_DIMMING WIFI_THREE_ANTENNA USB_PD_POLICY_MUNCH CPUSET_ASSIST; do
+          grep -E "CONFIG_(BOARD_MUNCH|QPNP_SMB5_MUNCH|FUEL_GAUGE_BQ27Z561_MUNCH|BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH|THERMAL_DIMMING|WIFI_THREE_ANTENNA|USB_PD_POLICY_MUNCH|BOARD_XIAOMI|CPUSET_ASSIST|TOUCHSCREEN_XIAOMI_TOUCHFEATURE|SECURITY_SMACK)" out/.config
+          for SYM in BOARD_XIAOMI BOARD_MUNCH QPNP_SMB5_MUNCH FUEL_GAUGE_BQ27Z561_MUNCH BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH THERMAL_DIMMING WIFI_THREE_ANTENNA USB_PD_POLICY_MUNCH CPUSET_ASSIST TOUCHSCREEN_XIAOMI_TOUCHFEATURE; do
             if ! grep -q "CONFIG_${SYM}=y" out/.config; then
               echo "!! CONFIG_${SYM} not set, aborting"
               exit 1
