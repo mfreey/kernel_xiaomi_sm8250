@@ -77,6 +77,11 @@ jobs:
             # struct cs_target（定义在 #ifdef CONFIG_CPUSET_ASSIST 内），不开该配置即编译失败
             # （Run#8 实测 cpuset.c:1937 incomplete type）。该特性也是调度优化一部分，显式开启
             echo "CONFIG_CPUSET_ASSIST=y" >> out/.config
+            # 禁用 Smack：Run#11 实测 smack_lsm.c 20+ 处把 sk->sk_security（本树为
+            # SELinux 专用内联数组）当 struct socket_smack * 指针用，与 AppArmor 的
+            # SK_CTX 冲突同根同源。Android 实际只用 SELinux，munch 官方 stock 亦无
+            # Smack，安全禁用；kconfig 解析后行覆盖前行，连带清掉全部子选项
+            echo "# CONFIG_SECURITY_SMACK is not set" >> out/.config
             make O=out ARCH=arm64 olddefconfig
           else
             echo "!! Fragment not found: arch/arm64/configs/vendor/${DEVICE_FRAG}"
@@ -102,13 +107,19 @@ jobs:
           grep -n '=$' out/.config || true
           # 硬校验关键配置全部生效（CHARGER_LN8000_MUNCH 是死配置，不验；由 BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH 实际门控 67W 驱动）
           echo "=== Munch key configs ==="
-          grep -E "CONFIG_(BOARD_MUNCH|QPNP_SMB5_MUNCH|FUEL_GAUGE_BQ27Z561_MUNCH|BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH|THERMAL_DIMMING|WIFI_THREE_ANTENNA|USB_PD_POLICY_MUNCH|BOARD_XIAOMI|CPUSET_ASSIST)" out/.config
+          grep -E "CONFIG_(BOARD_MUNCH|QPNP_SMB5_MUNCH|FUEL_GAUGE_BQ27Z561_MUNCH|BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH|THERMAL_DIMMING|WIFI_THREE_ANTENNA|USB_PD_POLICY_MUNCH|BOARD_XIAOMI|CPUSET_ASSIST|SECURITY_SMACK)" out/.config
           for SYM in BOARD_XIAOMI BOARD_MUNCH QPNP_SMB5_MUNCH FUEL_GAUGE_BQ27Z561_MUNCH BQ2597X_CHARGE_PUMP_STANDALONE_MUNCH THERMAL_DIMMING WIFI_THREE_ANTENNA USB_PD_POLICY_MUNCH CPUSET_ASSIST; do
             if ! grep -q "CONFIG_${SYM}=y" out/.config; then
               echo "!! CONFIG_${SYM} not set, aborting"
               exit 1
             fi
           done
+          # Smack 禁用校验：若被某依赖重新打开则在此立即失败（而不是跑到 security/ 才炸）
+          if ! grep -q "^# CONFIG_SECURITY_SMACK is not set" out/.config; then
+            echo "!! CONFIG_SECURITY_SMACK still enabled, aborting"
+            grep -E "SECURITY_SMACK|DEFAULT_SECURITY|^CONFIG_LSM" out/.config || true
+            exit 1
+          fi
 
       - name: Patch D8G source fixes
         run: |
