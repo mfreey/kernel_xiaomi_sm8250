@@ -126,8 +126,11 @@ jobs:
             echo "# CONFIG_DVB_MPQ is not set" >> out/.config
             echo "# CONFIG_DVB_MPQ_DEMUX is not set" >> out/.config
             # 内核命名：Aurora（极光）——冷静/流动/省电观感，切合
-            # 官方省电调度+温控定位；显示为 4.19.157-Aurora
-            echo "CONFIG_LOCALVERSION=-Aurora" >> out/.config
+            # 官方省电调度+温控定位；显示为 4.19.332-Aurora
+            # 注意：字符串符号必须带双引号，scripts/config --set-str
+            # 自动处理引号并先删旧行（Run#24 教训：echo 不带引号的值
+            # 被 kconfig 静默拒绝，LOCALVERSION 回落为空）
+            ./scripts/config --file out/.config --set-str LOCALVERSION "-Aurora"
             make O=out ARCH=arm64 olddefconfig
           else
             echo "!! Fragment not found: arch/arm64/configs/vendor/${DEVICE_FRAG}"
